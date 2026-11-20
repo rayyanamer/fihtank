@@ -1,27 +1,27 @@
 * {
-  box-sizing: border-box;
-  margin: 0;
-  padding: 0;
-  user-select: none;
-  -webkit-tap-highlight-color: transparent;
+box-sizing: border-box;
+margin: 0;
+padding: 0;
+user-select: none;
+-webkit-tap-highlight-color: transparent;
 }
 
 html,
 body {
-  width: 100%;
-  height: 100%;
-  overflow: hidden;
-  background-color: #05090d;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+width: 100%;
+height: 100%;
+overflow: hidden;
+background-color: #05090d;
+display: flex;
+align-items: center;
+justify-content: center;
 }
 
 #world {
-  display: block;
-  width: 100vw;
-  height: 100vh;
-  cursor: pointer;
-  image-rendering: pixelated;
-  image-rendering: crisp-edges;
+display: block;
+width: 100vw;
+height: 100vh;
+cursor: pointer;
+image-rendering: pixelated;
+image-rendering: crisp-edges;
 }
