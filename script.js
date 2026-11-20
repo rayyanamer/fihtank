@@ -1,6 +1,6 @@
-import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+import { initializeApp } from "https://www.gstatic.com/firebasejs/13.4.0/firebase-app.js";
+import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/13.4.0/firebase-auth.js";
+import { getDatabase, ref, set, onValue } from "https://www.gstatic.com/firebasejs/13.4.0/firebase-database.js";
 
 (function () {
   "use strict";
@@ -8,14 +8,20 @@ import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/f
   const canvas = document.getElementById("world");
   const ctx = canvas.getContext("2d", { alpha: false });
 
-  const appId = typeof __app_id !== "undefined" ? __app_id : "default-app-id";
-  const firebaseConfigStr = typeof __firebase_config !== "undefined" ? __firebase_config : "";
-  const initialAuthToken = typeof __initial_auth_token !== "undefined" ? __initial_auth_token : undefined;
+  const firebaseConfig = {
+    apiKey: "AIzaSyAL5nMn3cz41ejuzdIf9rQYUsp2q_YHLG4",
+    authDomain: "fihtank.firebaseapp.com",
+    databaseURL: "https://fihtank-default-rtdb.asia-southeast1.firebasedatabase.app",
+    projectId: "fihtank",
+    storageBucket: "fihtank.firebasestorage.app",
+    messagingSenderId: "408782023308",
+    appId: "1:408782023308:web:fbb94ab17a659e2280a9a9"
+  };
 
   let db = null;
   let auth = null;
   let currentUser = null;
-  let syncDocRef = null;
+  let syncDbRef = null;
   let syncReady = false;
   let isLeader = false;
   let leaderId = "";
@@ -209,6 +215,9 @@ import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/f
     return jar.top + clamp(ry, 0.02, 0.98) * span;
   }
 
+  const seenEventIds = new Set();
+  let pendingEvents = [];
+
   function applyRemoteFishSnapshot(data) {
     if (!data || !currentUser || data.senderId === clientId) return;
 
@@ -286,9 +295,6 @@ import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/f
     }
   }
 
-  const seenEventIds = new Set();
-  let pendingEvents = [];
-
   function queueGlobalEvent(type, x, y, dir) {
     if (!syncReady || !currentUser) return;
     const evId = clientId + "_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7);
@@ -306,7 +312,7 @@ import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/f
   }
 
   async function pushGlobalState(force) {
-    if (!syncReady || !currentUser || !syncDocRef) return;
+    if (!syncReady || !currentUser || !syncDbRef) return;
     const now = performance.now();
     if (!force && now - lastBroadcast < 85) return;
     lastBroadcast = now;
@@ -315,56 +321,45 @@ import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/f
     pendingEvents = [];
 
     try {
-      await setDoc(
-        syncDocRef,
-        {
-          senderId: clientId,
-          userId: currentUser.uid,
-          leaderId: isLeader ? clientId : leaderId,
-          heartbeatMs: Date.now(),
-          updatedAtMs: Date.now(),
-          rx: normXRatio(fish.x),
-          ry: normYRatio(fish.y),
-          rvx: fish.vx,
-          rvy: fish.vy,
-          angle: fish.angle,
-          targetAngle: fish.targetAngle,
-          pitchAngle: fish.pitchAngle,
-          speed: fish.speed,
-          state: fish.state,
-          depth: fish.depth,
-          targetDepth: fish.targetDepth,
-          sandDashDir: fish.sandDashDir,
-          rDashEndX: normXRatio(fish.sandDashEndX),
-          events: eventsToSend
-        },
-        { merge: true }
-      );
+      await set(syncDbRef, {
+        senderId: clientId,
+        userId: currentUser.uid,
+        leaderId: isLeader ? clientId : leaderId,
+        heartbeatMs: Date.now(),
+        updatedAtMs: Date.now(),
+        rx: normXRatio(fish.x),
+        ry: normYRatio(fish.y),
+        rvx: fish.vx,
+        rvy: fish.vy,
+        angle: fish.angle,
+        targetAngle: fish.targetAngle,
+        pitchAngle: fish.pitchAngle,
+        speed: fish.speed,
+        state: fish.state,
+        depth: fish.depth,
+        targetDepth: fish.targetDepth,
+        sandDashDir: fish.sandDashDir,
+        rDashEndX: normXRatio(fish.sandDashEndX),
+        events: eventsToSend
+      });
     } catch (_) {}
   }
 
   async function initGlobalSync() {
-    if (!firebaseConfigStr) return;
     try {
-      const firebaseConfig = JSON.parse(firebaseConfigStr);
       const app = initializeApp(firebaseConfig);
       auth = getAuth(app);
-      db = getFirestore(app);
+      db = getDatabase(app);
 
-      if (initialAuthToken) {
-        await signInWithCustomToken(auth, initialAuthToken);
-      } else {
-        await signInAnonymously(auth);
-      }
-
+      await signInAnonymously(auth);
       currentUser = auth.currentUser;
       if (!currentUser) return;
 
-      syncDocRef = doc(db, "artifacts", appId, "public", "data", "aquarium_sync", "main_tank");
+      syncDbRef = ref(db, "aquarium_sync/main_tank");
       syncReady = true;
 
-      onSnapshot(
-        syncDocRef,
+      onValue(
+        syncDbRef,
         (snap) => {
           if (!snap.exists()) {
             isLeader = true;
@@ -372,7 +367,7 @@ import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/f
             pushGlobalState(true);
             return;
           }
-          const data = snap.data();
+          const data = snap.val();
           const nowMs = Date.now();
           const hbAge = nowMs - (data.heartbeatMs || 0);
           if (!data.leaderId || hbAge > 3500) {
