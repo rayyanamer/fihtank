@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Dithered Fish Jar Ecosystem</title>
   <style>
-    /* Reset and lock viewport to a pure digital world with zero chrome */
+
     * {
       box-sizing: border-box;
       margin: 0;
@@ -25,7 +25,7 @@
       justify-content: center;
     }
 
-    /* Full-bleed pixel-dithered digital canvas */
+    
     #world {
       display: block;
       width: 100vw;
@@ -37,41 +37,28 @@
   </style>
 </head>
 <body>
-  <!-- Pure full-screen dithered ecosystem surface -->
+
   <canvas id="world"></canvas>
 
   <script>
     (function () {
       "use strict";
 
-      /**
-       * Architectural Overview:
-       * Pure pixel-dithered digital aquarium ("fish jar") simulation with multi-plane depth.
-       * Every surface—cylindrical glass jar walls, perspective depth bands, water caustics,
-       * sandy bed, dithered rocks, swaying sea grass blades, rising bubbles, and the swimming
-       * fish—is rendered on a coarse dither pixel grid using ordered Bayer 4x4 thresholding.
-       *
-       * Depth Architecture:
-       * - Five continuous depth strata (0.0 far back wall -> 1.0 near front glass), with
-       *   perspective size scaling, depth-based color/dither attenuation, cylindrical jar
-       *   curvature, and per-pixel depth-sorted occlusion so the fish slips behind near/mid
-       *   grass and rocks and emerges cleanly into view.
-       */
 
       const canvas = document.getElementById("world");
       const ctx = canvas.getContext("2d", { alpha: false });
 
-      // Dither pixel cell size in CSS pixels (larger = chunkier retro dither)
+      
       let cellSize = 4;
       let cols = 160;
       let rows = 90;
       let dpr = 1;
 
-      // Offscreen dither pixel buffer: stores packed RGBA or color string per cell
+      
       let gridColors = [];
       let gridGlow = [];
 
-      // 4x4 Bayer ordered dithering matrix normalized to [0, 1)
+      
       const BAYER_4X4 = [
         [0 / 16, 8 / 16, 2 / 16, 10 / 16],
         [12 / 16, 4 / 16, 14 / 16, 6 / 16],
@@ -79,7 +66,7 @@
         [15 / 16, 7 / 16, 13 / 16, 5 / 16]
       ];
 
-      // Jar boundary coordinates in dither grid space
+     
       const jar = {
         left: 16,
         right: 144,
@@ -89,17 +76,16 @@
         waterLine: 18
       };
 
-      // Per-cell depth buffer to handle true depth ordering between fish, grass, rocks, and bubbles
       let gridDepth = [];
 
-      // Ecosystem entities
+    
       let grassStalks = [];
       let rocks = [];
       let bubbles = [];
       let motes = [];
       let sandPebbles = [];
 
-      // Fish state with smooth kinematics and depth ("hiding") mechanics
+   
       const fish = {
         x: 72,
         y: 44,
@@ -116,34 +102,27 @@
         orbitAngle: 0,
         orbitRadius: 11,
         orbitStepsLeft: 0,
-        depth: 0.5,       // 0.0 = far back, 0.5 = mid, 1.0 = front
+        depth: 0.5,       
         targetDepth: 0.5,
         turnCooldown: 0,
         burstTimer: 0
       };
 
-      // Simulation clock
+     
       let lastTime = 0;
       let elapsed = 0;
       let stepScale = 1;
 
-      /**
-       * Clamp value between min and max.
-       */
+     
       function clamp(val, min, max) {
         return Math.max(min, Math.min(max, val));
       }
 
-      /**
-       * Linear interpolation between a and b by t.
-       */
+     
       function lerp(a, b, t) {
         return a + (b - a) * t;
       }
 
-      /**
-       * Shortest signed angle difference between target and current angle in radians.
-       */
       function angleDiff(target, current) {
         let diff = (target - current) % (Math.PI * 2);
         if (diff > Math.PI) diff -= Math.PI * 2;
@@ -151,39 +130,29 @@
         return diff;
       }
 
-      /**
-       * Random floating-point number in [min, max).
-       */
       function randRange(min, max) {
         return min + Math.random() * (max - min);
       }
 
-      /**
-       * Ordered 4x4 Bayer dithering pass for normalized intensity v in [0, 1].
-       */
+     
       function ditherPass(v, x, y) {
         const bx = ((Math.round(x) % 4) + 4) % 4;
         const by = ((Math.round(y) % 4) + 4) % 4;
         return clamp(v, 0, 1) > BAYER_4X4[by][bx];
       }
 
-      /**
-       * Choose between two hex colors using ordered 4x4 Bayer dithering by factor t in [0, 1].
-       */
+    
       function ditherMix(colorA, colorB, t, x, y) {
         return ditherPass(t, x, y) ? colorB : colorA;
       }
 
-      /**
-       * Resize canvas, compute dither pixel grid dimensions, update jar geometry,
-       * and repopulate ecosystem entities cleanly.
-       */
+     
       function resizeWorld() {
         const width = window.innerWidth || document.documentElement.clientWidth || 800;
         const height = window.innerHeight || document.documentElement.clientHeight || 600;
         dpr = clamp(window.devicePixelRatio || 1, 1, 2);
 
-        // Adapt dither cell size to viewport so the jar fits comfortably across screens
+        
         cellSize = clamp(Math.round(Math.min(width, height) / 145), 3, 7);
 
         cols = Math.max(48, Math.floor(width / cellSize));
@@ -192,7 +161,7 @@
         canvas.width = cols * cellSize;
         canvas.height = rows * cellSize;
 
-        // Compute centered jar bounds within the dither grid
+       
         const padX = Math.max(4, Math.floor(cols * 0.08));
         const padY = Math.max(3, Math.floor(rows * 0.07));
         jar.left = padX;
@@ -206,9 +175,7 @@
         populateEcosystem();
       }
 
-      /**
-       * Allocate dither color, glow, and depth buffers for the current grid size.
-       */
+    
       function allocateGrid() {
         const total = cols * rows;
         gridColors = new Array(total).fill("#05090d");
@@ -216,9 +183,7 @@
         gridDepth = new Array(total).fill(-1);
       }
 
-      /**
-       * Clear grid buffer each frame.
-       */
+     
       function clearGrid() {
         for (let i = 0; i < gridColors.length; i++) {
           gridColors[i] = "#05090d";
@@ -227,10 +192,7 @@
         }
       }
 
-      /**
-       * Write a single dithered pixel into the grid safely with depth testing.
-       * Items with higher depth (closer to viewer) overwrite lower-depth items.
-       */
+      
       function setPixel(x, y, color, glow = false, depth = 0.5) {
         const gx = Math.round(x);
         const gy = Math.round(y);
@@ -243,9 +205,7 @@
         }
       }
 
-      /**
-       * Check whether a dither cell is currently empty/background.
-       */
+      
       function isEmptyCell(x, y) {
         const gx = Math.round(x);
         const gy = Math.round(y);
@@ -253,34 +213,26 @@
         return gridColors[gy * cols + gx] === "#05090d";
       }
 
-      /**
-       * Helper: Compute perspective scale factor from a normalized depth [0..1].
-       * Farther items (depth ~ 0.1) appear smaller; closer items (depth ~ 0.95) appear larger.
-       */
+      
       function depthScale(depth) {
         return lerp(0.68, 1.32, clamp(depth, 0, 1));
       }
 
-      /**
-       * Helper: Compute cylindrical horizontal parallax offset for a given depth [0..1]
-       * so near objects shift slightly more across the curved glass jar than far ones.
-       */
+    
       function cylindricalShift(x, depth) {
         const centerX = (jar.left + jar.right) * 0.5;
         const normX = (x - centerX) / Math.max(1, (jar.right - jar.left) * 0.5);
         return Math.pow(normX, 3) * (depth - 0.5) * 3.4;
       }
 
-      /**
-       * Build sunken dithered rocks, multi-layered swaying sea grass blades, pebbles, and motes.
-       */
+    
       function populateEcosystem() {
         const innerLeft = jar.left + 6;
         const innerRight = jar.right - 6;
         const innerWidth = Math.max(24, innerRight - innerLeft);
         const floorY = jar.sandTop;
 
-        // 1. Sunken dithered stones across far, mid, and near foreground depth planes
+        
         rocks = [];
         const rockCount = innerWidth > 90 ? 5 : 3;
         const rockDefs = [
@@ -312,7 +264,7 @@
           });
         }
 
-        // 2. Multi-plane sea grass stalks across 5 distinct depth bands
+       
         grassStalks = [];
         const stalkCount = clamp(Math.floor(innerWidth / 4.6), 22, 56);
         const maxGrassHeight = Math.max(12, floorY - jar.waterLine - 4);
@@ -326,19 +278,19 @@
             jar.right - 3
           );
 
-          // Five depth strata for rich foreground/midground/background layering
+      
           let depth;
           const band = i % 5;
           if (band === 0) {
-            depth = randRange(0.12, 0.26); // Far background
+            depth = randRange(0.12, 0.26); 
           } else if (band === 1) {
-            depth = randRange(0.28, 0.44); // Back-mid
+            depth = randRange(0.28, 0.44); 
           } else if (band === 2) {
-            depth = randRange(0.46, 0.58); // Mid plane
+            depth = randRange(0.46, 0.58); 
           } else if (band === 3) {
-            depth = randRange(0.62, 0.78); // Near-mid
+            depth = randRange(0.62, 0.78); 
           } else {
-            depth = randRange(0.80, 0.96); // Close foreground
+            depth = randRange(0.80, 0.96); 
           }
 
           const pScale = depthScale(depth);
@@ -367,7 +319,7 @@
           });
         }
 
-        // 3. Dithered pebbles along the sand bed with depth variation
+  
         sandPebbles = [];
         const pebbleCount = Math.floor(innerWidth / 5.5);
         for (let i = 0; i < pebbleCount; i++) {
@@ -383,7 +335,7 @@
           });
         }
 
-        // 4. Multi-depth underwater drift motes
+      
         motes = [];
         const moteCount = clamp(Math.floor(innerWidth / 6), 16, 44);
         for (let i = 0; i < moteCount; i++) {
@@ -398,7 +350,7 @@
           });
         }
 
-        // 5. Initial dithered bubbles across depths
+
         bubbles = [];
         for (let i = 0; i < 12; i++) {
           const bDepth = randRange(0.15, 0.95);
@@ -410,14 +362,11 @@
           );
         }
 
-        // Place fish safely inside water volume
+
         fish.x = clamp(fish.x, jar.left + 14, jar.right - 14);
         fish.y = clamp(fish.y, jar.waterLine + 6, floorY - 7);
       }
 
-      /**
-       * Spawn a single rising dithered bubble inside the jar at a given depth.
-       */
       function spawnBubble(x, y, radius = 1.5, depth = 0.5) {
         const maxBubbles = 68;
         if (bubbles.length >= maxBubbles) {
@@ -434,11 +383,7 @@
         });
       }
 
-      /**
-       * Pick a new natural swimming behavior for the fish:
-       * wandering through the jar or orbiting/rotating around a swaying grass stalk,
-       * while shifting depth so it hides behind foreground/midground grass and rocks.
-       */
+    
       function chooseNextFishBehavior() {
         const innerLeft = jar.left + 12;
         const innerRight = jar.right - 12;
@@ -490,9 +435,7 @@
         }
       }
 
-      /**
-       * Update fish kinematics, rock avoidance, grass orbiting, and depth transitions.
-       */
+ 
       function updateFish(dt) {
         const innerLeft = jar.left + 11;
         const innerRight = jar.right - 11;
@@ -547,7 +490,7 @@
           }
         }
 
-        // Gentle boundary steering
+ 
         let avoidX = 0;
         let avoidY = 0;
         const margin = 12.0;
@@ -564,7 +507,7 @@
         if (fish.y > bottomBound - 6.0) {
           avoidY -= ((fish.y - (bottomBound - 6.0)) / 6.0) * 1.4;
         }
-        // Soft steering around dithered rocks at similar depth
+    
         for (let i = 0; i < rocks.length; i++) {
           const r = rocks[i];
           if (Math.abs(r.depth - fish.depth) > 0.35) continue;
