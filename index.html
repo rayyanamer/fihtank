@@ -1,0 +1,1401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dithered Fish Jar Ecosystem</title>
+  <style>
+    /* Reset and lock viewport to a pure digital world with zero chrome */
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: #05090d;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* Full-bleed pixel-dithered digital canvas */
+    #world {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      cursor: pointer;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+  </style>
+</head>
+<body>
+  <!-- Pure full-screen dithered ecosystem surface -->
+  <canvas id="world"></canvas>
+
+  <script>
+    (function () {
+      "use strict";
+
+      /**
+       * Architectural Overview:
+       * Pure pixel-dithered digital aquarium ("fish jar") simulation with multi-plane depth.
+       * Every surface—cylindrical glass jar walls, perspective depth bands, water caustics,
+       * sandy bed, dithered rocks, swaying sea grass blades, rising bubbles, and the swimming
+       * fish—is rendered on a coarse dither pixel grid using ordered Bayer 4x4 thresholding.
+       *
+       * Depth Architecture:
+       * - Five continuous depth strata (0.0 far back wall -> 1.0 near front glass), with
+       *   perspective size scaling, depth-based color/dither attenuation, cylindrical jar
+       *   curvature, and per-pixel depth-sorted occlusion so the fish slips behind near/mid
+       *   grass and rocks and emerges cleanly into view.
+       */
+
+      const canvas = document.getElementById("world");
+      const ctx = canvas.getContext("2d", { alpha: false });
+
+      // Dither pixel cell size in CSS pixels (larger = chunkier retro dither)
+      let cellSize = 4;
+      let cols = 160;
+      let rows = 90;
+      let dpr = 1;
+
+      // Offscreen dither pixel buffer: stores packed RGBA or color string per cell
+      let gridColors = [];
+      let gridGlow = [];
+
+      // 4x4 Bayer ordered dithering matrix normalized to [0, 1)
+      const BAYER_4X4 = [
+        [0 / 16, 8 / 16, 2 / 16, 10 / 16],
+        [12 / 16, 4 / 16, 14 / 16, 6 / 16],
+        [3 / 16, 11 / 16, 1 / 16, 9 / 16],
+        [15 / 16, 7 / 16, 13 / 16, 5 / 16]
+      ];
+
+      // Jar boundary coordinates in dither grid space
+      const jar = {
+        left: 16,
+        right: 144,
+        top: 8,
+        bottom: 82,
+        sandTop: 70,
+        waterLine: 18
+      };
+
+      // Per-cell depth buffer to handle true depth ordering between fish, grass, rocks, and bubbles
+      let gridDepth = [];
+
+      // Ecosystem entities
+      let grassStalks = [];
+      let rocks = [];
+      let bubbles = [];
+      let motes = [];
+      let sandPebbles = [];
+
+      // Fish state with smooth kinematics and depth ("hiding") mechanics
+      const fish = {
+        x: 72,
+        y: 44,
+        vx: 0.32,
+        vy: 0.0,
+        angle: 0,
+        targetAngle: 0,
+        speed: 0.36,
+        baseSpeed: 0.34,
+        tailPhase: 0,
+        finPhase: 0,
+        wanderTimer: 0,
+        orbitTarget: null,
+        orbitAngle: 0,
+        orbitRadius: 11,
+        orbitStepsLeft: 0,
+        depth: 0.5,       // 0.0 = far back, 0.5 = mid, 1.0 = front
+        targetDepth: 0.5,
+        turnCooldown: 0,
+        burstTimer: 0
+      };
+
+      // Simulation clock
+      let lastTime = 0;
+      let elapsed = 0;
+      let stepScale = 1;
+
+      /**
+       * Clamp value between min and max.
+       */
+      function clamp(val, min, max) {
+        return Math.max(min, Math.min(max, val));
+      }
+
+      /**
+       * Linear interpolation between a and b by t.
+       */
+      function lerp(a, b, t) {
+        return a + (b - a) * t;
+      }
+
+      /**
+       * Shortest signed angle difference between target and current angle in radians.
+       */
+      function angleDiff(target, current) {
+        let diff = (target - current) % (Math.PI * 2);
+        if (diff > Math.PI) diff -= Math.PI * 2;
+        if (diff < -Math.PI) diff += Math.PI * 2;
+        return diff;
+      }
+
+      /**
+       * Random floating-point number in [min, max).
+       */
+      function randRange(min, max) {
+        return min + Math.random() * (max - min);
+      }
+
+      /**
+       * Ordered 4x4 Bayer dithering pass for normalized intensity v in [0, 1].
+       */
+      function ditherPass(v, x, y) {
+        const bx = ((Math.round(x) % 4) + 4) % 4;
+        const by = ((Math.round(y) % 4) + 4) % 4;
+        return clamp(v, 0, 1) > BAYER_4X4[by][bx];
+      }
+
+      /**
+       * Choose between two hex colors using ordered 4x4 Bayer dithering by factor t in [0, 1].
+       */
+      function ditherMix(colorA, colorB, t, x, y) {
+        return ditherPass(t, x, y) ? colorB : colorA;
+      }
+
+      /**
+       * Resize canvas, compute dither pixel grid dimensions, update jar geometry,
+       * and repopulate ecosystem entities cleanly.
+       */
+      function resizeWorld() {
+        const width = window.innerWidth || document.documentElement.clientWidth || 800;
+        const height = window.innerHeight || document.documentElement.clientHeight || 600;
+        dpr = clamp(window.devicePixelRatio || 1, 1, 2);
+
+        // Adapt dither cell size to viewport so the jar fits comfortably across screens
+        cellSize = clamp(Math.round(Math.min(width, height) / 145), 3, 7);
+
+        cols = Math.max(48, Math.floor(width / cellSize));
+        rows = Math.max(36, Math.floor(height / cellSize));
+
+        canvas.width = cols * cellSize;
+        canvas.height = rows * cellSize;
+
+        // Compute centered jar bounds within the dither grid
+        const padX = Math.max(4, Math.floor(cols * 0.08));
+        const padY = Math.max(3, Math.floor(rows * 0.07));
+        jar.left = padX;
+        jar.right = Math.max(jar.left + 24, cols - 1 - padX);
+        jar.top = padY;
+        jar.bottom = Math.max(jar.top + 20, rows - 1 - padY);
+        jar.waterLine = clamp(jar.top + Math.floor((jar.bottom - jar.top) * 0.14), jar.top + 3, jar.bottom - 10);
+        jar.sandTop = clamp(jar.bottom - Math.max(5, Math.floor((jar.bottom - jar.top) * 0.16)), jar.waterLine + 8, jar.bottom - 3);
+
+        allocateGrid();
+        populateEcosystem();
+      }
+
+      /**
+       * Allocate dither color, glow, and depth buffers for the current grid size.
+       */
+      function allocateGrid() {
+        const total = cols * rows;
+        gridColors = new Array(total).fill("#05090d");
+        gridGlow = new Array(total).fill(false);
+        gridDepth = new Array(total).fill(-1);
+      }
+
+      /**
+       * Clear grid buffer each frame.
+       */
+      function clearGrid() {
+        for (let i = 0; i < gridColors.length; i++) {
+          gridColors[i] = "#05090d";
+          gridGlow[i] = false;
+          gridDepth[i] = -1;
+        }
+      }
+
+      /**
+       * Write a single dithered pixel into the grid safely with depth testing.
+       * Items with higher depth (closer to viewer) overwrite lower-depth items.
+       */
+      function setPixel(x, y, color, glow = false, depth = 0.5) {
+        const gx = Math.round(x);
+        const gy = Math.round(y);
+        if (gx < 0 || gx >= cols || gy < 0 || gy >= rows) return;
+        const idx = gy * cols + gx;
+        if (depth >= gridDepth[idx]) {
+          gridColors[idx] = color;
+          gridGlow[idx] = glow;
+          gridDepth[idx] = depth;
+        }
+      }
+
+      /**
+       * Check whether a dither cell is currently empty/background.
+       */
+      function isEmptyCell(x, y) {
+        const gx = Math.round(x);
+        const gy = Math.round(y);
+        if (gx < 0 || gx >= cols || gy < 0 || gy >= rows) return false;
+        return gridColors[gy * cols + gx] === "#05090d";
+      }
+
+      /**
+       * Helper: Compute perspective scale factor from a normalized depth [0..1].
+       * Farther items (depth ~ 0.1) appear smaller; closer items (depth ~ 0.95) appear larger.
+       */
+      function depthScale(depth) {
+        return lerp(0.68, 1.32, clamp(depth, 0, 1));
+      }
+
+      /**
+       * Helper: Compute cylindrical horizontal parallax offset for a given depth [0..1]
+       * so near objects shift slightly more across the curved glass jar than far ones.
+       */
+      function cylindricalShift(x, depth) {
+        const centerX = (jar.left + jar.right) * 0.5;
+        const normX = (x - centerX) / Math.max(1, (jar.right - jar.left) * 0.5);
+        return Math.pow(normX, 3) * (depth - 0.5) * 3.4;
+      }
+
+      /**
+       * Build sunken dithered rocks, multi-layered swaying sea grass blades, pebbles, and motes.
+       */
+      function populateEcosystem() {
+        const innerLeft = jar.left + 6;
+        const innerRight = jar.right - 6;
+        const innerWidth = Math.max(24, innerRight - innerLeft);
+        const floorY = jar.sandTop;
+
+        // 1. Sunken dithered stones across far, mid, and near foreground depth planes
+        rocks = [];
+        const rockCount = innerWidth > 90 ? 5 : 3;
+        const rockDefs = [
+          { rxFrac: 0.18, width: 16, height: 8, depth: 0.22, light: "#75899e", dark: "#2b3540" },
+          { rxFrac: 0.44, width: 22, height: 10, depth: 0.54, light: "#8fa4b8", dark: "#343e4a" },
+          { rxFrac: 0.76, width: 18, height: 9, depth: 0.28, light: "#798da3", dark: "#2d3742" },
+          { rxFrac: 0.33, width: 15, height: 7, depth: 0.84, light: "#a8bdd1", dark: "#3f4b59" },
+          { rxFrac: 0.66, width: 17, height: 8, depth: 0.90, light: "#b2c7db", dark: "#43505e" }
+        ];
+
+        for (let i = 0; i < rockCount; i++) {
+          const def = rockDefs[i % rockDefs.length];
+          const scale = depthScale(def.depth);
+          const w = clamp(Math.round(def.width * scale), 8, Math.floor(innerWidth * 0.26));
+          const h = clamp(Math.round(def.height * scale), 5, Math.floor((floorY - jar.waterLine) * 0.24));
+          const cx = Math.round(innerLeft + def.rxFrac * innerWidth + randRange(-2.5, 2.5));
+          const x0 = clamp(Math.round(cx - w * 0.5), jar.left + 3, jar.right - w - 2);
+          const yBaseShift = Math.round((def.depth - 0.5) * 2.2);
+          const y0 = clamp(floorY - h + 1 + yBaseShift, jar.waterLine + 4, jar.bottom - h);
+
+          rocks.push({
+            x: x0,
+            y: y0,
+            w,
+            h,
+            depth: def.depth,
+            light: def.light,
+            dark: def.dark
+          });
+        }
+
+        // 2. Multi-plane sea grass stalks across 5 distinct depth bands
+        grassStalks = [];
+        const stalkCount = clamp(Math.floor(innerWidth / 4.6), 22, 56);
+        const maxGrassHeight = Math.max(12, floorY - jar.waterLine - 4);
+
+        for (let i = 0; i < stalkCount; i++) {
+          const t = stalkCount === 1 ? 0.5 : i / (stalkCount - 1);
+          const clusterOffset = Math.sin(t * Math.PI * 6 + i * 0.7) * 3.6;
+          const baseX = clamp(
+            Math.round(innerLeft + t * innerWidth + clusterOffset),
+            jar.left + 3,
+            jar.right - 3
+          );
+
+          // Five depth strata for rich foreground/midground/background layering
+          let depth;
+          const band = i % 5;
+          if (band === 0) {
+            depth = randRange(0.12, 0.26); // Far background
+          } else if (band === 1) {
+            depth = randRange(0.28, 0.44); // Back-mid
+          } else if (band === 2) {
+            depth = randRange(0.46, 0.58); // Mid plane
+          } else if (band === 3) {
+            depth = randRange(0.62, 0.78); // Near-mid
+          } else {
+            depth = randRange(0.80, 0.96); // Close foreground
+          }
+
+          const pScale = depthScale(depth);
+          const height = clamp(
+            Math.round(randRange(maxGrassHeight * 0.38, maxGrassHeight * 0.98) * lerp(0.82, 1.15, depth)),
+            9,
+            maxGrassHeight
+          );
+
+          const palettes = [
+            { dark: "#0e3d29", mid: "#1c734b", tip: "#4ad18c" },
+            { dark: "#124b33", mid: "#248f5d", tip: "#63e6a1" },
+            { dark: "#0b3322", mid: "#176340", tip: "#3ec27e" }
+          ];
+
+          grassStalks.push({
+            baseX,
+            baseY: clamp(floorY + Math.round((depth - 0.5) * 2.4), jar.sandTop - 1, jar.bottom - 2),
+            height,
+            thickness: clamp(randRange(1.0, 1.9) * pScale, 0.9, 2.8),
+            depth,
+            phase: randRange(0, Math.PI * 2),
+            swaySpeed: randRange(1.05, 2.05),
+            swayAmp: randRange(1.8, 4.4) * lerp(0.75, 1.25, depth),
+            palette: palettes[i % palettes.length]
+          });
+        }
+
+        // 3. Dithered pebbles along the sand bed with depth variation
+        sandPebbles = [];
+        const pebbleCount = Math.floor(innerWidth / 5.5);
+        for (let i = 0; i < pebbleCount; i++) {
+          const pDepth = randRange(0.15, 0.95);
+          const pScale = depthScale(pDepth);
+          sandPebbles.push({
+            x: randRange(jar.left + 4, jar.right - 4),
+            y: randRange(floorY + 0.8, jar.bottom - 1.2),
+            rx: randRange(1.1, 2.2) * pScale,
+            ry: randRange(0.7, 1.3) * pScale,
+            depth: pDepth,
+            color: pDepth > 0.55 ? "#c4aa79" : "#786340"
+          });
+        }
+
+        // 4. Multi-depth underwater drift motes
+        motes = [];
+        const moteCount = clamp(Math.floor(innerWidth / 6), 16, 44);
+        for (let i = 0; i < moteCount; i++) {
+          const mDepth = randRange(0.12, 0.95);
+          motes.push({
+            x: randRange(jar.left + 4, jar.right - 4),
+            y: randRange(jar.waterLine + 2, floorY - 2),
+            vx: randRange(-0.07, 0.07) * depthScale(mDepth),
+            vy: randRange(-0.05, 0.03),
+            depth: mDepth,
+            phase: randRange(0, Math.PI * 2)
+          });
+        }
+
+        // 5. Initial dithered bubbles across depths
+        bubbles = [];
+        for (let i = 0; i < 12; i++) {
+          const bDepth = randRange(0.15, 0.95);
+          spawnBubble(
+            randRange(jar.left + 8, jar.right - 8),
+            randRange(jar.waterLine + 4, floorY - 2),
+            randRange(0.9, 2.1) * depthScale(bDepth),
+            bDepth
+          );
+        }
+
+        // Place fish safely inside water volume
+        fish.x = clamp(fish.x, jar.left + 14, jar.right - 14);
+        fish.y = clamp(fish.y, jar.waterLine + 6, floorY - 7);
+      }
+
+      /**
+       * Spawn a single rising dithered bubble inside the jar at a given depth.
+       */
+      function spawnBubble(x, y, radius = 1.5, depth = 0.5) {
+        const maxBubbles = 68;
+        if (bubbles.length >= maxBubbles) {
+          bubbles.shift();
+        }
+        bubbles.push({
+          x,
+          y,
+          radius,
+          depth: clamp(depth, 0.1, 0.98),
+          vy: randRange(0.14, 0.32) * (0.75 + radius * 0.25),
+          wobblePhase: randRange(0, Math.PI * 2),
+          wobbleSpeed: randRange(2.5, 4.5)
+        });
+      }
+
+      /**
+       * Pick a new natural swimming behavior for the fish:
+       * wandering through the jar or orbiting/rotating around a swaying grass stalk,
+       * while shifting depth so it hides behind foreground/midground grass and rocks.
+       */
+      function chooseNextFishBehavior() {
+        const innerLeft = jar.left + 12;
+        const innerRight = jar.right - 12;
+        const topBound = jar.waterLine + 5;
+        const bottomBound = jar.sandTop - 5;
+
+        const roll = Math.random();
+        if (roll < 0.38 && grassStalks.length > 0) {
+          const candidates = grassStalks.filter((s) => s.height >= 12);
+          const stalk =
+            candidates.length > 0
+              ? candidates[Math.floor(Math.random() * candidates.length)]
+              : grassStalks[Math.floor(Math.random() * grassStalks.length)];
+
+          const centerY = clamp(
+            stalk.baseY - stalk.height * randRange(0.35, 0.72),
+            topBound,
+            bottomBound
+          );
+
+          fish.orbitTarget = {
+            x: stalk.baseX,
+            y: centerY,
+            stalkRef: stalk
+          };
+          fish.orbitRadius = randRange(8.0, 14.5);
+          fish.orbitAngle = Math.atan2(fish.y - centerY, fish.x - stalk.baseX);
+          fish.orbitStepsLeft = Math.floor(randRange(140, 290));
+
+          fish.targetDepth = clamp(
+            stalk.depth + randRange(-0.28, 0.28),
+            0.15,
+            0.92
+          );
+        } else {
+          fish.orbitTarget = null;
+          const goalX = randRange(innerLeft, innerRight);
+          const goalY = randRange(topBound, bottomBound);
+          fish.targetAngle = Math.atan2(goalY - fish.y, goalX - fish.x);
+          fish.wanderTimer = randRange(1.4, 3.6);
+
+          if (Math.random() < 0.45) {
+            fish.targetDepth = randRange(0.15, 0.42);
+          } else if (Math.random() < 0.75) {
+            fish.targetDepth = randRange(0.42, 0.65);
+          } else {
+            fish.targetDepth = randRange(0.65, 0.92);
+          }
+        }
+      }
+
+      /**
+       * Update fish kinematics, rock avoidance, grass orbiting, and depth transitions.
+       */
+      function updateFish(dt) {
+        const innerLeft = jar.left + 11;
+        const innerRight = jar.right - 11;
+        const topBound = jar.waterLine + 4.5;
+        const bottomBound = jar.sandTop - 4.5;
+
+        fish.tailPhase += dt * (9 + fish.speed * 22);
+        fish.finPhase += dt * 6.5;
+
+        if (fish.turnCooldown > 0) fish.turnCooldown -= dt;
+        if (fish.burstTimer > 0) {
+          fish.burstTimer -= dt;
+          fish.speed = lerp(fish.speed, fish.baseSpeed * 1.75, dt * 5);
+        } else {
+          fish.speed = lerp(fish.speed, fish.baseSpeed, dt * 3);
+        }
+
+        fish.depth = lerp(fish.depth, fish.targetDepth, dt * 1.8);
+
+        if (fish.orbitTarget && fish.orbitStepsLeft > 0) {
+          const stalk = fish.orbitTarget.stalkRef;
+          const swayOffset =
+            Math.sin(elapsed * stalk.swaySpeed + stalk.phase) * stalk.swayAmp;
+          const cx = fish.orbitTarget.x + swayOffset;
+          const cy = fish.orbitTarget.y;
+
+          const angularVel = (fish.speed / Math.max(6.0, fish.orbitRadius)) * 1.15;
+          fish.orbitAngle += angularVel * dt * 14;
+          fish.orbitStepsLeft--;
+
+          const desiredX = clamp(
+            cx + Math.cos(fish.orbitAngle) * fish.orbitRadius,
+            innerLeft,
+            innerRight
+          );
+          const desiredY = clamp(
+            cy + Math.sin(fish.orbitAngle) * (fish.orbitRadius * 0.65),
+            topBound,
+            bottomBound
+          );
+
+          const dx = desiredX - fish.x;
+          const dy = desiredY - fish.y;
+          if (Math.hypot(dx, dy) > 0.4) {
+            fish.targetAngle = Math.atan2(dy, dx);
+          }
+        } else {
+          fish.orbitTarget = null;
+          fish.wanderTimer -= dt;
+          if (fish.wanderTimer <= 0) {
+            chooseNextFishBehavior();
+          }
+        }
+
+        // Gentle boundary steering
+        let avoidX = 0;
+        let avoidY = 0;
+        const margin = 12.0;
+
+        if (fish.x < innerLeft + margin) {
+          avoidX += ((innerLeft + margin - fish.x) / margin) * 1.6;
+        }
+        if (fish.x > innerRight - margin) {
+          avoidX -= ((fish.x - (innerRight - margin)) / margin) * 1.6;
+        }
+        if (fish.y < topBound + 6.0) {
+          avoidY += ((topBound + 6.0 - fish.y) / 6.0) * 1.4;
+        }
+        if (fish.y > bottomBound - 6.0) {
+          avoidY -= ((fish.y - (bottomBound - 6.0)) / 6.0) * 1.4;
+        }
+        // Soft steering around dithered rocks at similar depth
+        for (let i = 0; i < rocks.length; i++) {
+          const r = rocks[i];
+          if (Math.abs(r.depth - fish.depth) > 0.35) continue;
+          const centerX = r.x + r.w * 0.5;
+          const centerY = r.y + r.h * 0.5;
+          const dx = fish.x - centerX;
+          const dy = fish.y - centerY;
+          const dist = Math.hypot(dx, dy);
+          const minDist = Math.max(r.w * 0.65, 10.5);
+
+          if (dist > 0.01 && dist < minDist) {
+            const push = ((minDist - dist) / minDist) * 1.3;
+            avoidX += (dx / dist) * push;
+            avoidY += (dy / dist) * push;
+          }
+        }
+
+        if (Math.abs(avoidX) > 0.01 || Math.abs(avoidY) > 0.01) {
+          const desiredDirX = Math.cos(fish.targetAngle) + avoidX;
+          const desiredDirY = Math.sin(fish.targetAngle) + avoidY;
+          fish.targetAngle = Math.atan2(desiredDirY, desiredDirX);
+        }
+
+        const diff = angleDiff(fish.targetAngle, fish.angle);
+        const turnRate = 3.2;
+        fish.angle += clamp(diff, -turnRate * dt, turnRate * dt);
+        fish.angle = Math.atan2(Math.sin(fish.angle), Math.cos(fish.angle));
+
+        const stepScale = dt * 60;
+        fish.vx = Math.cos(fish.angle) * fish.speed;
+        fish.vy = Math.sin(fish.angle) * fish.speed * 0.72;
+
+        fish.x = clamp(fish.x + fish.vx * stepScale, innerLeft, innerRight);
+        fish.y = clamp(fish.y + fish.vy * stepScale, topBound, bottomBound);
+
+        if (
+          (fish.x <= innerLeft + 0.4 || fish.x >= innerRight - 0.4) &&
+          fish.turnCooldown <= 0
+        ) {
+          const centerX = (innerLeft + innerRight) * 0.5;
+          const centerY = (topBound + bottomBound) * 0.5;
+          fish.targetAngle = Math.atan2(centerY - fish.y, centerX - fish.x);
+          fish.turnCooldown = 0.6;
+        }
+      }
+
+
+      function updateParticles(dt) {
+        if (Math.random() < dt * 2.8 && rocks.length > 0) {
+          const r = rocks[Math.floor(Math.random() * rocks.length)];
+          const bDepth = clamp(r.depth + randRange(-0.15, 0.15), 0.12, 0.96);
+          spawnBubble(
+            r.x + randRange(2, r.w - 2),
+            r.y + 1,
+            randRange(0.9, 2.0) * depthScale(bDepth),
+            bDepth
+          );
+        }
+
+        for (let i = bubbles.length - 1; i >= 0; i--) {
+          const b = bubbles[i];
+          b.wobblePhase += b.wobbleSpeed * dt;
+          b.y -= b.vy * stepScale;
+          b.x += Math.sin(b.wobblePhase) * 0.11 * stepScale;
+          b.x = clamp(b.x, jar.left + 4, jar.right - 4);
+
+          if (b.y <= jar.waterLine + 1.0) {
+            bubbles.splice(i, 1);
+          }
+        }
+
+        for (let i = 0; i < motes.length; i++) {
+          const m = motes[i];
+          m.phase += dt * 1.5;
+          m.x += (m.vx + Math.cos(m.phase) * 0.04) * stepScale;
+          m.y += (m.vy + Math.sin(m.phase * 0.7) * 0.03) * stepScale;
+
+          if (m.x < jar.left + 4) m.x = jar.right - 4;
+          if (m.x > jar.right - 4) m.x = jar.left + 4;
+          if (m.y < jar.waterLine + 2) m.y = jar.sandTop - 2;
+          if (m.y > jar.sandTop - 2) m.y = jar.waterLine + 2;
+        }
+      }
+
+  
+      function drawJarAndEnvironment() {
+        const glassDeep = "#244354";
+        const glassBright = "#78c8e6";
+        const waterFar = "#091822";
+        const waterDark = "#0d222e";
+        const waterMid = "#183b4d";
+        const waterLight = "#347896";
+        const sandDark = "#695537";
+        const sandMid = "#9e8356";
+        const sandLight = "#d1b788";
+
+        const jarCenterX = (jar.left + jar.right) * 0.5;
+        const jarHalfW = Math.max(1, (jar.right - jar.left) * 0.5);
+
+       
+        for (let y = jar.waterLine + 1; y < jar.sandTop; y++) {
+          const depthRatio = (y - jar.waterLine) / Math.max(1, jar.sandTop - jar.waterLine);
+          for (let x = jar.left + 1; x < jar.right; x++) {
+            const cylNorm = clamp((x - jarCenterX) / jarHalfW, -1, 1);
+            const cylShade = Math.sqrt(Math.max(0.15, 1 - cylNorm * cylNorm * 0.65));
+
+            const causticA = Math.sin(x * 0.16 + elapsed * 1.5 + y * 0.11) * 0.5 + 0.5;
+            const causticB = Math.cos(x * 0.12 - elapsed * 1.15 - y * 0.16) * 0.5 + 0.5;
+            const caustic = causticA * causticB * (1.0 - depthRatio * 0.68) * cylShade;
+            const baseTone = clamp((0.14 + caustic * 0.48 - depthRatio * 0.1) * cylShade + 0.04, 0.04, 0.72);
+
+            if (ditherPass(baseTone, x, y)) {
+              const col = ditherMix(waterMid, waterLight, caustic * 0.85, x, y);
+              setPixel(x, y, col, false, 0.02);
+            } else if (ditherPass(0.28 - depthRatio * 0.15, x, y)) {
+              setPixel(x, y, ditherMix(waterFar, waterDark, cylShade, x, y), false, 0.01);
+            }
+          }
+        }
+
+        
+        const cornerR = 4;
+        for (let y = jar.top; y <= jar.bottom; y++) {
+          for (let x = jar.left; x <= jar.right; x++) {
+ 
+            let inCornerCut = false;
+            if (x < jar.left + cornerR && y < jar.top + cornerR) {
+              const dx = jar.left + cornerR - x;
+              const dy = jar.top + cornerR - y;
+              if (Math.hypot(dx, dy) > cornerR + 0.4) inCornerCut = true;
+            } else if (x > jar.right - cornerR && y < jar.top + cornerR) {
+              const dx = x - (jar.right - cornerR);
+              const dy = jar.top + cornerR - y;
+              if (Math.hypot(dx, dy) > cornerR + 0.4) inCornerCut = true;
+            } else if (x < jar.left + cornerR && y > jar.bottom - cornerR) {
+              const dx = jar.left + cornerR - x;
+              const dy = y - (jar.bottom - cornerR);
+              if (Math.hypot(dx, dy) > cornerR + 0.4) inCornerCut = true;
+            } else if (x > jar.right - cornerR && y > jar.bottom - cornerR) {
+              const dx = x - (jar.right - cornerR);
+              const dy = y - (jar.bottom - cornerR);
+              if (Math.hypot(dx, dy) > cornerR + 0.4) inCornerCut = true;
+            }
+            if (inCornerCut) continue;
+
+            const isTop = y === jar.top || (y < jar.top + cornerR && (x <= jar.left + cornerR || x >= jar.right - cornerR) &&
+              Math.abs(Math.hypot(
+                x < jar.left + cornerR ? jar.left + cornerR - x : x - (jar.right - cornerR),
+                jar.top + cornerR - y
+              ) - cornerR) < 0.85);
+            const isBottom = y === jar.bottom || (y > jar.bottom - cornerR && (x <= jar.left + cornerR || x >= jar.right - cornerR) &&
+              Math.abs(Math.hypot(
+                x < jar.left + cornerR ? jar.left + cornerR - x : x - (jar.right - cornerR),
+                y - (jar.bottom - cornerR)
+              ) - cornerR) < 0.85);
+            const isLeft = x === jar.left && y >= jar.top + cornerR && y <= jar.bottom - cornerR;
+            const isRight = x === jar.right && y >= jar.top + cornerR && y <= jar.bottom - cornerR;
+
+            if (isTop || isBottom || isLeft || isRight) {
+              const shimmer = 0.45 + 0.45 * Math.sin(x * 0.25 + y * 0.2 - elapsed * 1.2);
+              const col = ditherMix(glassDeep, glassBright, shimmer, x, y);
+              setPixel(x, y, col, shimmer > 0.78, 0.99);
+            } else if (x === jar.left + 1 && y > jar.top + 3 && y < jar.bottom - 3) {
+
+              const streak = 0.25 + 0.55 * Math.sin(y * 0.14 - elapsed * 0.9);
+              if (ditherPass(streak, x, y)) {
+                setPixel(x, y, ditherMix(glassDeep, glassBright, streak, x, y), false, 0.98);
+              }
+            }
+          }
+        }
+
+
+        for (let x = jar.left + 1; x < jar.right; x++) {
+          const wave = Math.sin(elapsed * 2.4 + x * 0.22) * 0.5 + 0.5;
+          const yOffset = Math.round(Math.sin(elapsed * 2.0 + x * 0.18) * 0.6);
+          const col = ditherMix(waterLight, glassBright, wave, x, jar.waterLine + yOffset);
+          setPixel(x, jar.waterLine + yOffset, col, true, 0.96);
+          if (ditherPass(wave * 0.55, x, jar.waterLine + yOffset + 1)) {
+            setPixel(x, jar.waterLine + yOffset + 1, waterMid, false, 0.85);
+          }
+        }
+
+
+        for (let y = jar.sandTop; y < jar.bottom; y++) {
+          const sandDepth = (y - jar.sandTop) / Math.max(1, jar.bottom - jar.sandTop);
+          const approxDepth = clamp(0.15 + sandDepth * 0.8, 0.15, 0.95);
+          for (let x = jar.left + 1; x < jar.right; x++) {
+            if (!isEmptyCell(x, y) && y >= jar.bottom - cornerR) continue;
+
+            const dune = Math.sin(x * 0.1 + sandDepth * 2.2) * 0.14;
+            const lightFactor = clamp(0.78 - sandDepth * 0.68 + dune, 0.08, 0.92);
+            const col =
+              lightFactor > 0.45
+                ? ditherMix(sandMid, sandLight, (lightFactor - 0.45) * 1.8, x, y)
+                : ditherMix(sandDark, sandMid, lightFactor * 2.1, x, y);
+
+            setPixel(x, y, col, false, approxDepth);
+          }
+        }
+
+
+        const sortedPebbles = sandPebbles.slice().sort((a, b) => a.depth - b.depth);
+        for (let i = 0; i < sortedPebbles.length; i++) {
+          const p = sortedPebbles[i];
+          const minX = Math.floor(p.x - p.rx);
+          const maxX = Math.ceil(p.x + p.rx);
+          const minY = Math.floor(p.y - p.ry);
+          const maxY = Math.ceil(p.y + p.ry);
+
+          for (let py = minY; py <= maxY; py++) {
+            for (let px = minX; px <= maxX; px++) {
+              const nx = (px - p.x) / p.rx;
+              const ny = (py - p.y) / p.ry;
+              if (nx * nx + ny * ny <= 1.0) {
+                const shade = clamp(0.75 - ny * 0.35 - nx * 0.2, 0.2, 0.95);
+                if (ditherPass(shade, px, py)) {
+                  setPixel(px, py, p.color, false, p.depth);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      
+      function drawGrassStalk(stalk) {
+        const parallaxX = cylindricalShift(stalk.baseX, stalk.depth);
+        const depthAtten = lerp(0.68, 1.05, stalk.depth);
+
+        for (let h = 0; h < stalk.height; h++) {
+          const y = stalk.baseY - h;
+          if (y <= jar.waterLine || y >= jar.bottom) continue;
+
+          const heightRatio = h / Math.max(1, stalk.height - 1);
+          const sway =
+            Math.sin(elapsed * stalk.swaySpeed + stalk.phase - h * 0.13) *
+            stalk.swayAmp *
+            Math.pow(heightRatio, 1.35);
+
+          const centerX = clamp(stalk.baseX + parallaxX + sway, jar.left + 2, jar.right - 2);
+          const halfW = stalk.thickness * (1.0 - heightRatio * 0.55) * 0.5;
+          const minX = Math.floor(centerX - halfW - 0.5);
+          const maxX = Math.ceil(centerX + halfW + 0.5);
+
+          for (let px = minX; px <= maxX; px++) {
+            if (px <= jar.left || px >= jar.right) continue;
+            const distFromCenter = Math.abs(px - centerX) / Math.max(0.4, halfW + 0.5);
+            if (distFromCenter > 1.0) continue;
+
+            const edgeShade = (1.0 - distFromCenter * 0.45) * depthAtten;
+            const tipMix = clamp(heightRatio * 0.85 + stalk.depth * 0.22, 0.1, 0.95);
+
+            let col;
+            if (h >= stalk.height - 2) {
+              col = ditherMix(stalk.palette.mid, stalk.palette.tip, clamp(edgeShade, 0, 1), px, y);
+            } else {
+              col = ditherMix(stalk.palette.dark, stalk.palette.mid, clamp(tipMix * edgeShade, 0, 1), px, y);
+            }
+
+            if (ditherPass(clamp(edgeShade * 0.92, 0.15, 0.98), px, y)) {
+              setPixel(px, y, col, h >= stalk.height - 1 && stalk.depth > 0.55, stalk.depth);
+            }
+          }
+        }
+      }
+
+    
+      function drawRock(rock) {
+        const parallaxX = cylindricalShift(rock.x + rock.w * 0.5, rock.depth);
+        const cx = rock.x + rock.w * 0.5 + parallaxX;
+        const rx = rock.w * 0.5;
+        const ry = rock.h;
+        const baseY = rock.y + rock.h - 1;
+        const depthAtten = lerp(0.72, 1.05, rock.depth);
+
+        for (let py = rock.y; py <= baseY; py++) {
+          if (py <= jar.waterLine || py >= jar.bottom) continue;
+          const dy = (baseY - py) / Math.max(1, ry);
+          const spanX = rx * Math.sqrt(Math.max(0, 1 - dy * dy * 0.72));
+
+          for (let px = Math.floor(cx - spanX); px <= Math.ceil(cx + spanX); px++) {
+            if (px <= jar.left || px >= jar.right) continue;
+            const nx = (px - cx) / Math.max(1, rx);
+            // Directional light from upper-left scaled by depth
+            const lightScore = clamp((0.55 + dy * 0.45 - nx * 0.35) * depthAtten, 0.1, 0.95);
+            const col = ditherMix(rock.dark, rock.light, lightScore, px, py);
+            setPixel(px, py, col, false, rock.depth);
+          }
+        }
+      }
+
+  
+      function drawFish() {
+        const facingLeft = Math.cos(fish.angle) < -0.08;
+        const dir = facingLeft ? -1 : 1;
+        const pScale = depthScale(fish.depth);
+        const fishParallaxX = cylindricalShift(fish.x, fish.depth);
+        const fx = fish.x + fishParallaxX;
+        const fy = fish.y;
+
+        const tailWag = Math.sin(fish.tailPhase) * 2.4 * pScale;
+        const finFlap = Math.sin(fish.finPhase) * 1.2 * pScale;
+        const pitch = clamp(fish.vy * 4.5, -2.5, 2.5) * pScale;
+
+       
+        const depthTint = clamp((fish.depth - 0.15) / 0.8, 0, 1);
+        const bodyOrange = ditherMix("#d96b2b", "#ff8c42", depthTint, Math.round(fx), Math.round(fy));
+        const bodyGold = "#ffd166";
+        const bodyDeep = "#b84718";
+        const finColor = "#ffaa64";
+
+        const bodyRx = 5.4 * pScale;
+        const bodyRy = 2.7 * pScale;
+        const tailLen = 4.2 * pScale;
+
+        const minX = Math.floor(fx - bodyRx - tailLen - 2);
+        const maxX = Math.ceil(fx + bodyRx + tailLen + 2);
+        const minY = Math.floor(fy - bodyRy - 4 * pScale - 2);
+        const maxY = Math.ceil(fy + bodyRy + 4 * pScale + 2);
+
+        for (let py = minY; py <= maxY; py++) {
+          for (let px = minX; px <= maxX; px++) {
+            if (px <= jar.left || px >= jar.right || py <= jar.waterLine || py >= jar.sandTop) {
+              continue;
+            }
+
+            
+            if (isPixelOccludedForFish(px, py)) {
+              continue;
+            }
+
+            const localX = (px - fx) * dir;
+            const localY = py - fy - pitch * (1.0 - Math.abs(localX) / (bodyRx + 2 * pScale));
+
+         
+            const normBody = (localX * localX) / (bodyRx * bodyRx) + (localY * localY) / (bodyRy * bodyRy);
+            if (normBody <= 1.0) {
+              const stripe = 0.5 + 0.5 * Math.sin((localX / pScale) * 1.15 + elapsed * 2.5);
+              const bellyShade = clamp(0.65 - localY / (bodyRy * 2.5), 0.15, 0.95);
+              const baseCol = ditherMix(bodyDeep, bodyOrange, bellyShade, px, py);
+              const finalCol = ditherMix(baseCol, bodyGold, stripe * 0.45, px, py);
+              setPixel(px, py, finalCol, false, fish.depth);
+              continue;
+            }
+
+           
+            if (localX < -bodyRx + 0.6 * pScale && localX > -bodyRx - tailLen) {
+              const tailT = (-bodyRx + 0.6 * pScale - localX) / (tailLen + 0.6 * pScale);
+              const tailCenterY = tailWag * tailT * 1.25;
+              const tailHalfSpan = (1.0 + tailT * 2.4) * pScale;
+              if (Math.abs(localY - tailCenterY) <= tailHalfSpan) {
+                const edgeFade = 1.0 - Math.abs(localY - tailCenterY) / (tailHalfSpan + 0.4);
+                if (ditherPass(edgeFade * 0.9 + 0.1, px, py)) {
+                  setPixel(px, py, ditherMix(bodyDeep, finColor, tailT * 0.7, px, py), false, fish.depth);
+                }
+              }
+            }
+
+            if (
+              localX >= -2.2 * pScale &&
+              localX <= 1.6 * pScale &&
+              localY < -bodyRy + 0.4 * pScale &&
+              localY >= -bodyRy - 2.0 * pScale + finFlap * 0.4
+            ) {
+              if (ditherPass(0.75, px, py)) {
+                setPixel(px, py, finColor, false, fish.depth);
+              }
+            }
+
+          
+            if (
+              localX >= -1.2 * pScale &&
+              localX <= 1.2 * pScale &&
+              localY > bodyRy - 0.4 * pScale &&
+              localY <= bodyRy + 1.6 * pScale - finFlap * 0.3
+            ) {
+              if (ditherPass(0.68, px, py)) {
+                setPixel(px, py, finColor, false, fish.depth);
+              }
+            }
+          }
+        }
+
+     
+        const eyeX = Math.round(fx + dir * 2.8 * pScale);
+        const eyeY = Math.round(fy - 0.5 * pScale + pitch * 0.5);
+        if (
+          eyeX > jar.left &&
+          eyeX < jar.right &&
+          eyeY > jar.waterLine &&
+          eyeY < jar.sandTop &&
+          !isPixelOccludedForFish(eyeX, eyeY)
+        ) {
+          setPixel(eyeX, eyeY, "#ffffff", fish.depth > 0.45, fish.depth);
+        }
+      }
+
+ 
+      function isPixelOccludedForFish(px, py) {
+        for (let i = 0; i < grassStalks.length; i++) {
+          const s = grassStalks[i];
+          if (s.depth <= fish.depth + 0.03) continue;
+          if (py > s.baseY || py < s.baseY - s.height + 1) continue;
+
+          const h = s.baseY - py;
+          const heightRatio = h / Math.max(1, s.height - 1);
+          const sway =
+            Math.sin(elapsed * s.swaySpeed + s.phase - h * 0.13) *
+            s.swayAmp *
+            Math.pow(heightRatio, 1.35);
+          const parallaxX = cylindricalShift(s.baseX, s.depth);
+          const centerX = s.baseX + parallaxX + sway;
+          const halfW = s.thickness * (1.0 - heightRatio * 0.55) * 0.5 + 0.55;
+
+          if (Math.abs(px - centerX) <= halfW && ditherPass(0.88, px, py)) {
+            return true;
+          }
+        }
+
+        for (let i = 0; i < rocks.length; i++) {
+          const r = rocks[i];
+          if (r.depth <= fish.depth + 0.03) continue;
+          const parallaxX = cylindricalShift(r.x + r.w * 0.5, r.depth);
+          const cx = r.x + r.w * 0.5 + parallaxX;
+          const rx = r.w * 0.5;
+          const ry = r.h;
+          const baseY = r.y + r.h - 1;
+
+          if (py >= r.y && py <= baseY) {
+            const dy = (baseY - py) / Math.max(1, ry);
+            const spanX = rx * Math.sqrt(Math.max(0, 1 - dy * dy * 0.72));
+            if (Math.abs(px - cx) <= spanX) {
+              return true;
+            }
+          }
+        }
+
+        return false;
+      }
+
+   
+      function drawParticles() {
+        for (let i = 0; i < motes.length; i++) {
+          const m = motes[i];
+          if (m.y > jar.waterLine && m.y < jar.sandTop) {
+            const gx = Math.round(m.x + cylindricalShift(m.x, m.depth));
+            const gy = Math.round(m.y);
+            if (isEmptyCell(gx, gy) && ditherPass(0.35 + m.depth * 0.4, gx, gy)) {
+              setPixel(gx, gy, ditherMix("#264c61", "#529bb8", m.depth, gx, gy), false, m.depth);
+            }
+          }
+        }
+
+        const sortedBubbles = bubbles.slice().sort((a, b) => a.depth - b.depth);
+        for (let i = 0; i < sortedBubbles.length; i++) {
+          const b = sortedBubbles[i];
+          if (b.y <= jar.waterLine || b.y >= jar.sandTop) continue;
+
+          const bx = b.x + cylindricalShift(b.x, b.depth);
+          const by = b.y;
+          const minX = Math.floor(bx - b.radius);
+          const maxX = Math.ceil(bx + b.radius);
+          const minY = Math.floor(by - b.radius);
+          const maxY = Math.ceil(by + b.radius);
+
+          for (let py = minY; py <= maxY; py++) {
+            for (let px = minX; px <= maxX; px++) {
+              if (px <= jar.left || px >= jar.right || py <= jar.waterLine || py >= jar.sandTop) {
+                continue;
+              }
+              const dist = Math.hypot(px - bx, py - by);
+              if (dist <= b.radius) {
+                const rim = dist >= b.radius - 0.75;
+                const col = rim ? "#b5ecff" : "#5bb8db";
+                if (rim || ditherPass(0.55, px, py)) {
+                  setPixel(px, py, col, rim && b.depth > 0.5, b.depth);
+                }
+              }
+            }
+          }
+        }
+      }
+
+   
+      function drawGrassStalk(stalk) {
+        for (let h = 0; h < stalk.height; h++) {
+          const y = stalk.baseY - h;
+          if (y <= jar.waterLine || y >= jar.bottom) continue;
+
+          const heightRatio = h / Math.max(1, stalk.height - 1);
+          const sway =
+            Math.sin(elapsed * stalk.swaySpeed + stalk.phase - h * 0.13) *
+            stalk.swayAmp *
+            Math.pow(heightRatio, 1.35);
+
+          const centerX = clamp(stalk.baseX + sway, jar.left + 2, jar.right - 2);
+          const halfW = stalk.thickness * (1.0 - heightRatio * 0.55) * 0.5;
+          const minX = Math.floor(centerX - halfW - 0.5);
+          const maxX = Math.ceil(centerX + halfW + 0.5);
+
+          for (let px = minX; px <= maxX; px++) {
+            if (px <= jar.left || px >= jar.right) continue;
+            const distFromCenter = Math.abs(px - centerX) / Math.max(0.4, halfW + 0.5);
+            if (distFromCenter > 1.0) continue;
+
+            const edgeShade = 1.0 - distFromCenter * 0.45;
+            const tipMix = clamp(heightRatio * 0.85 + stalk.depth * 0.2, 0.1, 0.95);
+
+            let col;
+            if (h >= stalk.height - 2) {
+              col = ditherMix(stalk.palette.mid, stalk.palette.tip, edgeShade, px, y);
+            } else {
+              col = ditherMix(stalk.palette.dark, stalk.palette.mid, tipMix * edgeShade, px, y);
+            }
+
+            if (ditherPass(edgeShade * 0.92, px, y)) {
+              setPixel(px, y, col, h >= stalk.height - 1);
+            }
+          }
+        }
+      }
+
+    
+      function drawRock(rock) {
+        const cx = rock.x + rock.w * 0.5;
+        const rx = rock.w * 0.5;
+        const ry = rock.h;
+        const baseY = rock.y + rock.h - 1;
+
+        for (let py = rock.y; py <= baseY; py++) {
+          if (py <= jar.waterLine || py >= jar.bottom) continue;
+          const dy = (baseY - py) / Math.max(1, ry);
+          const spanX = rx * Math.sqrt(Math.max(0, 1 - dy * dy * 0.72));
+
+          for (let px = Math.floor(cx - spanX); px <= Math.ceil(cx + spanX); px++) {
+            if (px <= jar.left || px >= jar.right) continue;
+            const nx = (px - cx) / Math.max(1, rx);
+            
+            const lightScore = clamp(0.55 + dy * 0.45 - nx * 0.35, 0.1, 0.95);
+            const col = ditherMix(rock.dark, rock.light, lightScore, px, py);
+            setPixel(px, py, col);
+          }
+        }
+      }
+
+     
+      function drawFish() {
+        const facingLeft = Math.cos(fish.angle) < -0.08;
+        const dir = facingLeft ? -1 : 1;
+        const tailWag = Math.sin(fish.tailPhase) * 2.4;
+        const finFlap = Math.sin(fish.finPhase) * 1.2;
+        const pitch = clamp(fish.vy * 4.5, -2.5, 2.5);
+
+        const bodyOrange = "#ff8c42";
+        const bodyGold = "#ffd166";
+        const bodyDeep = "#c9531e";
+        const finColor = "#ffaa64";
+
+
+        const bodyRx = 5.4;
+        const bodyRy = 2.7;
+
+        const minX = Math.floor(fish.x - bodyRx - 5);
+        const maxX = Math.ceil(fish.x + bodyRx + 5);
+        const minY = Math.floor(fish.y - bodyRy - 4);
+        const maxY = Math.ceil(fish.y + bodyRy + 4);
+
+        for (let py = minY; py <= maxY; py++) {
+          for (let px = minX; px <= maxX; px++) {
+            if (px <= jar.left || px >= jar.right || py <= jar.waterLine || py >= jar.sandTop) {
+              continue;
+            }
+
+            if (isPixelOccludedForFish(px, py)) {
+              continue;
+            }
+
+            const localX = (px - fish.x) * dir;
+            const localY = py - fish.y - pitch * (1.0 - Math.abs(localX) / (bodyRx + 2));
+
+
+            const normBody = (localX * localX) / (bodyRx * bodyRx) + (localY * localY) / (bodyRy * bodyRy);
+            if (normBody <= 1.0) {
+              const stripe = 0.5 + 0.5 * Math.sin(localX * 1.15 + elapsed * 2.5);
+              const bellyShade = clamp(0.65 - localY / (bodyRy * 2.5), 0.15, 0.95);
+              const baseCol = ditherMix(bodyDeep, bodyOrange, bellyShade, px, py);
+              const finalCol = ditherMix(baseCol, bodyGold, stripe * 0.45, px, py);
+              setPixel(px, py, finalCol);
+              continue;
+            }
+
+            
+            if (localX < -bodyRx + 0.6 && localX > -bodyRx - 4.2) {
+              const tailT = (-bodyRx + 0.6 - localX) / 4.8;
+              const tailCenterY = tailWag * tailT * 1.25;
+              const tailHalfSpan = 1.0 + tailT * 2.4;
+              if (Math.abs(localY - tailCenterY) <= tailHalfSpan) {
+                const edgeFade = 1.0 - Math.abs(localY - tailCenterY) / (tailHalfSpan + 0.4);
+                if (ditherPass(edgeFade * 0.9 + 0.1, px, py)) {
+                  setPixel(px, py, ditherMix(bodyDeep, finColor, tailT * 0.7, px, py));
+                }
+              }
+            }
+
+            
+            if (localX >= -2.2 && localX <= 1.6 && localY < -bodyRy + 0.4 && localY >= -bodyRy - 2.0 + finFlap * 0.4) {
+              if (ditherPass(0.75, px, py)) {
+                setPixel(px, py, finColor);
+              }
+            }
+
+           
+            if (localX >= -1.2 && localX <= 1.2 && localY > bodyRy - 0.4 && localY <= bodyRy + 1.6 - finFlap * 0.3) {
+              if (ditherPass(0.68, px, py)) {
+                setPixel(px, py, finColor);
+              }
+            }
+          }
+        }
+
+        
+        const eyeX = Math.round(fish.x + dir * 2.8);
+        const eyeY = Math.round(fish.y - 0.5 + pitch * 0.5);
+        if (
+          eyeX > jar.left &&
+          eyeX < jar.right &&
+          eyeY > jar.waterLine &&
+          eyeY < jar.sandTop &&
+          !isPixelOccludedForFish(eyeX, eyeY)
+        ) {
+          setPixel(eyeX, eyeY, "#ffffff", true);
+        }
+      }
+
+      
+      function isPixelOccludedForFish(px, py) {
+        for (let i = 0; i < grassStalks.length; i++) {
+          const s = grassStalks[i];
+          if (s.depth <= fish.depth + 0.04) continue;
+          if (py > s.baseY || py < s.baseY - s.height + 1) continue;
+
+          const h = s.baseY - py;
+          const heightRatio = h / Math.max(1, s.height - 1);
+          const sway =
+            Math.sin(elapsed * s.swaySpeed + s.phase - h * 0.13) *
+            s.swayAmp *
+            Math.pow(heightRatio, 1.35);
+          const centerX = s.baseX + sway;
+          const halfW = s.thickness * (1.0 - heightRatio * 0.55) * 0.5 + 0.5;
+
+          if (Math.abs(px - centerX) <= halfW && ditherPass(0.85, px, py)) {
+            return true;
+          }
+        }
+
+        for (let i = 0; i < rocks.length; i++) {
+          const r = rocks[i];
+          if (r.depth <= fish.depth + 0.04) continue;
+          const cx = r.x + r.w * 0.5;
+          const rx = r.w * 0.5;
+          const ry = r.h;
+          const baseY = r.y + r.h - 1;
+
+          if (py >= r.y && py <= baseY) {
+            const dy = (baseY - py) / Math.max(1, ry);
+            const spanX = rx * Math.sqrt(Math.max(0, 1 - dy * dy * 0.72));
+            if (Math.abs(px - cx) <= spanX) {
+              return true;
+            }
+          }
+        }
+
+        return false;
+      }
+
+    
+      function drawParticles() {
+        for (let i = 0; i < motes.length; i++) {
+          const m = motes[i];
+          if (m.y > jar.waterLine && m.y < jar.sandTop) {
+            const gx = Math.round(m.x);
+            const gy = Math.round(m.y);
+            if (isEmptyCell(gx, gy) && ditherPass(0.55, gx, gy)) {
+              setPixel(gx, gy, "#3d748f");
+            }
+          }
+        }
+
+        for (let i = 0; i < bubbles.length; i++) {
+          const b = bubbles[i];
+          if (b.y <= jar.waterLine || b.y >= jar.sandTop) continue;
+
+          const minX = Math.floor(b.x - b.radius);
+          const maxX = Math.ceil(b.x + b.radius);
+          const minY = Math.floor(b.y - b.radius);
+          const maxY = Math.ceil(b.y + b.radius);
+
+          for (let py = minY; py <= maxY; py++) {
+            for (let px = minX; px <= maxX; px++) {
+              if (px <= jar.left || px >= jar.right || py <= jar.waterLine || py >= jar.sandTop) {
+                continue;
+              }
+              const dist = Math.hypot(px - b.x, py - b.y);
+              if (dist <= b.radius) {
+                const rim = dist >= b.radius - 0.75;
+                const col = rim ? "#b5ecff" : "#5bb8db";
+                if (rim || ditherPass(0.55, px, py)) {
+                  setPixel(px, py, col, rim);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      
+      function renderGridToCanvas() {
+        ctx.fillStyle = "#05090d";
+        ctx.fillRect(0, 0, cols * cellSize, rows * cellSize);
+
+        for (let y = 0; y < rows; y++) {
+          const py = y * cellSize;
+          const rowOffset = y * cols;
+
+          for (let x = 0; x < cols; x++) {
+            const idx = rowOffset + x;
+            const col = gridColors[idx];
+            if (col === "#05090d") continue;
+
+            const px = x * cellSize;
+            ctx.fillStyle = col;
+
+            if (gridGlow[idx]) {
+              ctx.shadowColor = col;
+              ctx.shadowBlur = cellSize * 1.4;
+            } else {
+              ctx.shadowBlur = 0;
+            }
+
+            ctx.fillRect(px, py, cellSize, cellSize);
+          }
+        }
+        ctx.shadowBlur = 0;
+      }
+
+      function tick(timestamp) {
+        try {
+          if (!lastTime) lastTime = timestamp;
+          const rawDt = (timestamp - lastTime) / 1000;
+          lastTime = timestamp;
+          const dt = clamp(rawDt, 0.001, 0.05);
+          stepScale = dt * 60;
+          elapsed += dt;
+
+          updateFish(dt);
+          updateParticles(dt);
+
+          clearGrid();
+          drawJarAndEnvironment();
+
+          const backRocks = rocks.filter((r) => r.depth < 0.5);
+          const midRocks = rocks.filter((r) => r.depth >= 0.5 && r.depth < 0.75);
+          const frontRocks = rocks.filter((r) => r.depth >= 0.75);
+
+          const backGrass = grassStalks.filter((g) => g.depth < 0.45);
+          const midGrass = grassStalks.filter((g) => g.depth >= 0.45 && g.depth < 0.72);
+          const frontGrass = grassStalks.filter((g) => g.depth >= 0.72);
+
+          for (let i = 0; i < backRocks.length; i++) drawRock(backRocks[i]);
+          for (let i = 0; i < backGrass.length; i++) drawGrassStalk(backGrass[i]);
+          for (let i = 0; i < midRocks.length; i++) drawRock(midRocks[i]);
+          for (let i = 0; i < midGrass.length; i++) drawGrassStalk(midGrass[i]);
+
+          drawFish();
+
+          for (let i = 0; i < frontRocks.length; i++) drawRock(frontRocks[i]);
+          for (let i = 0; i < frontGrass.length; i++) drawGrassStalk(frontGrass[i]);
+
+          drawParticles();
+          renderGridToCanvas();
+        } catch (err) {
+          console.error("Simulation tick error:", err);
+        }
+
+        requestAnimationFrame(tick);
+      }
+      
+      function handlePointerInteract(clientX, clientY) {
+        const gx = clientX / cellSize;
+        const gy = clientY / cellSize;
+
+        if (
+          gx >= jar.left &&
+          gx <= jar.right &&
+          gy >= jar.waterLine &&
+          gy <= jar.bottom
+        ) {
+          const clampedY = clamp(gy, jar.waterLine + 2, jar.sandTop - 2);
+          const clickDepth = randRange(0.25, 0.9);
+          for (let i = 0; i < 7; i++) {
+            const bDepth = clamp(clickDepth + randRange(-0.15, 0.15), 0.12, 0.96);
+            spawnBubble(
+              gx + randRange(-3.5, 3.5),
+              clampedY + randRange(-1.5, 2.0),
+              randRange(0.9, 2.1) * depthScale(bDepth),
+              bDepth
+            );
+          }
+
+          fish.orbitTarget = null;
+          fish.targetAngle = Math.atan2(clampedY - fish.y, gx - fish.x);
+          fish.wanderTimer = randRange(1.2, 2.4);
+          fish.burstTimer = 0.85;
+        }
+      }
+
+      canvas.addEventListener("pointerdown", (e) => {
+        handlePointerInteract(e.clientX, e.clientY);
+      });
+
+      window.addEventListener("resize", () => {
+        resizeWorld();
+      });
+
+      window.addEventListener("load", () => {
+        resizeWorld();
+        chooseNextFishBehavior();
+        requestAnimationFrame(tick);
+      });
+    })();
+  </script>
+</body>
+</html>
