@@ -1,8 +1,49 @@
+import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
 (function () {
   "use strict";
 
   const canvas = document.getElementById("world");
   const ctx = canvas.getContext("2d", { alpha: false });
+
+  const appId = typeof __app_id !== "undefined" ? __app_id : "default-app-id";
+  const firebaseConfigStr = typeof __firebase_config !== "undefined" ? __firebase_config : "";
+  const initialAuthToken = typeof __initial_auth_token !== "undefined" ? __initial_auth_token : undefined;
+
+  let db = null;
+  let auth = null;
+  let currentUser = null;
+  let syncDocRef = null;
+  let syncReady = false;
+  let isLeader = false;
+  let leaderId = "";
+  let lastHeartbeat = 0;
+  let lastBroadcast = 0;
+  let lastRemoteUpdate = 0;
+
+  const clientId =
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : "client_" + Math.random().toString(36).slice(2) + "_" + Date.now();
+
+  const remoteFish = {
+    x: 190,
+    y: 105,
+    vx: 0.45,
+    vy: 0,
+    angle: 0,
+    targetAngle: 0,
+    pitchAngle: 0,
+    speed: 0.48,
+    state: 0,
+    depth: 0.5,
+    targetDepth: 0.5,
+    sandDashDir: 1,
+    sandDashEndX: 190,
+    hasSnapshot: false
+  };
 
   let cellSize = 2;
   let cols = 380;
@@ -146,6 +187,216 @@
 
   function lerp(a, b, t) {
     return a + (b - a) * t;
+  }
+
+  function normXRatio(x) {
+    const span = Math.max(1, jar.right - jar.left);
+    return clamp((x - jar.left) / span, 0.04, 0.96);
+  }
+
+  function denormXRatio(rx) {
+    const span = Math.max(1, jar.right - jar.left);
+    return jar.left + clamp(rx, 0.04, 0.96) * span;
+  }
+
+  function normYRatio(y) {
+    const span = Math.max(1, jar.sandTop - jar.top);
+    return clamp((y - jar.top) / span, 0.02, 0.98);
+  }
+
+  function denormYRatio(ry) {
+    const span = Math.max(1, jar.sandTop - jar.top);
+    return jar.top + clamp(ry, 0.02, 0.98) * span;
+  }
+
+  function applyRemoteFishSnapshot(data) {
+    if (!data || !currentUser || data.senderId === clientId) return;
+
+    const nowMs = Date.now();
+    const ageSec = Math.max(0, (nowMs - (data.updatedAtMs || nowMs)) * 0.001);
+    if (ageSec > 12) return;
+
+    const baseX = denormXRatio(typeof data.rx === "number" ? data.rx : 0.5);
+    const baseY = denormYRatio(typeof data.ry === "number" ? data.ry : 0.5);
+    const rvx = typeof data.rvx === "number" ? data.rvx : 0;
+    const rvy = typeof data.rvy === "number" ? data.rvy : 0;
+    const rState = typeof data.state === "number" ? data.state : FISH_STATE.CRUISING;
+
+    let projX = baseX + rvx * ageSec * 60 * 0.45;
+    let projY = baseY + rvy * ageSec * 60 * 0.45;
+    if (rState === FISH_STATE.AIRBORNE) {
+      const g = 0.058 * (fish.baseSpeed / 0.48);
+      projY += 0.5 * g * Math.pow(ageSec * 60, 2) * 0.25;
+    }
+
+    remoteFish.x = clamp(projX, jar.left + 12, jar.right - 12);
+    remoteFish.y = clamp(projY, jar.top + 4, jar.sandTop - 5);
+    remoteFish.vx = rvx;
+    remoteFish.vy = rvy;
+    remoteFish.angle = typeof data.angle === "number" ? data.angle : 0;
+    remoteFish.targetAngle = typeof data.targetAngle === "number" ? data.targetAngle : remoteFish.angle;
+    remoteFish.pitchAngle = typeof data.pitchAngle === "number" ? data.pitchAngle : 0;
+    remoteFish.speed = typeof data.speed === "number" ? data.speed : fish.baseSpeed;
+    remoteFish.state = rState;
+    remoteFish.depth = typeof data.depth === "number" ? data.depth : 0.5;
+    remoteFish.targetDepth = typeof data.targetDepth === "number" ? data.targetDepth : remoteFish.depth;
+    remoteFish.sandDashDir = data.sandDashDir === -1 ? -1 : 1;
+    remoteFish.sandDashEndX = denormXRatio(typeof data.rDashEndX === "number" ? data.rDashEndX : 0.5);
+    remoteFish.hasSnapshot = true;
+    lastRemoteUpdate = performance.now();
+
+    if (Array.isArray(data.events)) {
+      for (let i = 0; i < data.events.length; i++) {
+        const ev = data.events[i];
+        if (!ev || !ev.id || ev.ts < nowMs - 8000) continue;
+        if (seenEventIds.has(ev.id)) continue;
+        seenEventIds.add(ev.id);
+        if (seenEventIds.size > 120) {
+          const firstKey = seenEventIds.values().next().value;
+          seenEventIds.delete(firstKey);
+        }
+
+        const ex = denormXRatio(ev.rx);
+        const ey = denormYRatio(ev.ry);
+        if (ev.type === "food") {
+          spawnFood(ex, clamp(ey, jar.top + 2, jar.waterLine - 1));
+        } else if (ev.type === "jump") {
+          spawnSurfaceRipple(ex, 0.75);
+          fish.x = clamp(ex, jar.left + 16, jar.right - 16);
+          fish.y = Math.min(fish.y, jar.waterLine + 3);
+          triggerWaterJump(ev.dir === -1 ? -1 : 1);
+        } else if (ev.type === "dash") {
+          const d = ev.dir === -1 ? -1 : 1;
+          spawnSandPlume(ex, jar.sandTop - 0.5, d, fish.depth, 14);
+          fish.x = clamp(ex, jar.left + 16, jar.right - 16);
+          fish.y = jar.sandTop - 2.6 * depthScale(fish.depth);
+          triggerSandDash(d);
+        } else if (ev.type === "bubble") {
+          for (let b = 0; b < 6; b++) {
+            spawnBubble(
+              ex + randRange(-4, 4),
+              clamp(ey, jar.waterLine + 3, jar.sandTop - 3),
+              randRange(1.0, 2.2),
+              fish.depth
+            );
+          }
+          spawnSurfaceRipple(ex, 0.45);
+        }
+      }
+    }
+  }
+
+  const seenEventIds = new Set();
+  let pendingEvents = [];
+
+  function queueGlobalEvent(type, x, y, dir) {
+    if (!syncReady || !currentUser) return;
+    const evId = clientId + "_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7);
+    seenEventIds.add(evId);
+    pendingEvents.push({
+      id: evId,
+      type,
+      rx: normXRatio(x),
+      ry: normYRatio(y),
+      dir: dir || 1,
+      ts: Date.now()
+    });
+    if (pendingEvents.length > 10) pendingEvents.shift();
+    pushGlobalState(true);
+  }
+
+  async function pushGlobalState(force) {
+    if (!syncReady || !currentUser || !syncDocRef) return;
+    const now = performance.now();
+    if (!force && now - lastBroadcast < 85) return;
+    lastBroadcast = now;
+
+    const eventsToSend = pendingEvents.slice();
+    pendingEvents = [];
+
+    try {
+      await setDoc(
+        syncDocRef,
+        {
+          senderId: clientId,
+          userId: currentUser.uid,
+          leaderId: isLeader ? clientId : leaderId,
+          heartbeatMs: Date.now(),
+          updatedAtMs: Date.now(),
+          rx: normXRatio(fish.x),
+          ry: normYRatio(fish.y),
+          rvx: fish.vx,
+          rvy: fish.vy,
+          angle: fish.angle,
+          targetAngle: fish.targetAngle,
+          pitchAngle: fish.pitchAngle,
+          speed: fish.speed,
+          state: fish.state,
+          depth: fish.depth,
+          targetDepth: fish.targetDepth,
+          sandDashDir: fish.sandDashDir,
+          rDashEndX: normXRatio(fish.sandDashEndX),
+          events: eventsToSend
+        },
+        { merge: true }
+      );
+    } catch (_) {}
+  }
+
+  async function initGlobalSync() {
+    if (!firebaseConfigStr) return;
+    try {
+      const firebaseConfig = JSON.parse(firebaseConfigStr);
+      const app = initializeApp(firebaseConfig);
+      auth = getAuth(app);
+      db = getFirestore(app);
+
+      if (initialAuthToken) {
+        await signInWithCustomToken(auth, initialAuthToken);
+      } else {
+        await signInAnonymously(auth);
+      }
+
+      currentUser = auth.currentUser;
+      if (!currentUser) return;
+
+      syncDocRef = doc(db, "artifacts", appId, "public", "data", "aquarium_sync", "main_tank");
+      syncReady = true;
+
+      onSnapshot(
+        syncDocRef,
+        (snap) => {
+          if (!snap.exists()) {
+            isLeader = true;
+            leaderId = clientId;
+            pushGlobalState(true);
+            return;
+          }
+          const data = snap.data();
+          const nowMs = Date.now();
+          const hbAge = nowMs - (data.heartbeatMs || 0);
+          if (!data.leaderId || hbAge > 3500) {
+            isLeader = true;
+            leaderId = clientId;
+          } else {
+            leaderId = data.leaderId;
+            isLeader = leaderId === clientId;
+          }
+          if (!isLeader) {
+            applyRemoteFishSnapshot(data);
+          }
+        },
+        () => {}
+      );
+
+      setTimeout(() => {
+        if (!remoteFish.hasSnapshot) {
+          isLeader = true;
+          leaderId = clientId;
+          pushGlobalState(true);
+        }
+      }, 650);
+    } catch (_) {}
   }
 
   function angleDiff(target, current) {
@@ -848,6 +1099,52 @@
     const topBound = jar.waterLine + 7.5;
     const bottomBound = jar.sandTop - 6.5;
 
+    if (syncReady && currentUser && !isLeader && remoteFish.hasSnapshot) {
+      const wasAirborne = fish.state === FISH_STATE.AIRBORNE;
+      const blend = 1 - Math.exp(-14 * dt);
+
+      fish.x = lerp(fish.x, remoteFish.x, blend);
+      fish.y = lerp(fish.y, remoteFish.y, blend);
+      fish.vx = lerp(fish.vx, remoteFish.vx, blend);
+      fish.vy = lerp(fish.vy, remoteFish.vy, blend);
+      fish.angle += angleDiff(remoteFish.angle, fish.angle) * blend;
+      fish.targetAngle = remoteFish.targetAngle;
+      fish.pitchAngle = lerp(fish.pitchAngle, remoteFish.pitchAngle, blend);
+      fish.speed = lerp(fish.speed, remoteFish.speed, blend);
+      fish.state = remoteFish.state;
+      fish.depth = lerp(fish.depth, remoteFish.depth, blend * 0.75);
+      fish.targetDepth = remoteFish.targetDepth;
+      fish.sandDashDir = remoteFish.sandDashDir;
+      fish.sandDashEndX = remoteFish.sandDashEndX;
+
+      if (!wasAirborne && fish.state === FISH_STATE.AIRBORNE) {
+        spawnWaterSplash(fish.x, fish.vx, 1.0);
+      } else if (wasAirborne && fish.state !== FISH_STATE.AIRBORNE && fish.y >= jar.waterLine) {
+        spawnWaterSplash(fish.x, fish.vx, 0.9);
+      }
+
+      if (fish.state === FISH_STATE.SAND_DASH && Math.abs(fish.y - (jar.sandTop - 2.6 * depthScale(fish.depth))) < 4.0) {
+        fish.sandTrailTimer += dt;
+        if (fish.sandTrailTimer >= 0.035) {
+          fish.sandTrailTimer = 0;
+          const tailX = fish.x - fish.sandDashDir * 6.5 * depthScale(fish.depth);
+          spawnSandPlume(tailX, jar.sandTop - 0.4, fish.sandDashDir, fish.depth, 4);
+        }
+      }
+
+      const swimActivity = Math.max(0.35, fish.speed / Math.max(0.1, fish.baseSpeed));
+      fish.tailPhase += dt * (11.0 * swimActivity + fish.speed * 14);
+      fish.bodyWavePhase += dt * (9.5 * swimActivity + fish.speed * 11);
+      fish.finPhase += dt * (6.8 * swimActivity);
+      fish.gillPhase += dt * 5.8;
+
+      if (performance.now() - lastRemoteUpdate > 4000) {
+        isLeader = true;
+        leaderId = clientId;
+      }
+      return;
+    }
+
     if (fish.turnCooldown > 0) fish.turnCooldown -= dt;
     if (fish.eatFlutterTimer > 0) fish.eatFlutterTimer -= dt;
     if (fish.jumpCooldown > 0) fish.jumpCooldown -= dt;
@@ -1172,6 +1469,13 @@
       const centerY = (topBound + bottomBound) * 0.5;
       fish.targetAngle = Math.atan2(centerY - fish.y, jar.centerX - fish.x);
       fish.turnCooldown = 0.6;
+    }
+
+    if (syncReady && currentUser && isLeader) {
+      const nowMs = Date.now();
+      const forceSend = pendingEvents.length > 0 || nowMs - lastHeartbeat > 1200;
+      if (forceSend) lastHeartbeat = nowMs;
+      pushGlobalState(forceSend);
     }
   }
 
@@ -2217,6 +2521,7 @@
 
     if (gx > jar.left + 3 && gx < jar.right - 3 && gy < jar.waterLine) {
       spawnFood(gx, gy);
+      queueGlobalEvent("food", gx, gy, 1);
       return;
     }
 
@@ -2228,8 +2533,10 @@
       fish.state !== FISH_STATE.AIRBORNE &&
       fish.state !== FISH_STATE.JUMP_PREP
     ) {
-      spawnSandPlume(gx, jar.sandTop - 0.5, gx >= fish.x ? 1 : -1, fish.depth, 14);
-      triggerSandDash(gx >= fish.x ? 1 : -1);
+      const dir = gx >= fish.x ? 1 : -1;
+      spawnSandPlume(gx, jar.sandTop - 0.5, dir, fish.depth, 14);
+      triggerSandDash(dir);
+      queueGlobalEvent("dash", gx, gy, dir);
       return;
     }
 
@@ -2241,8 +2548,10 @@
       fish.state !== FISH_STATE.AIRBORNE &&
       fish.state !== FISH_STATE.JUMP_PREP
     ) {
+      const dir = gx >= fish.x ? 1 : -1;
       spawnSurfaceRipple(gx, 0.75);
-      triggerWaterJump(gx >= fish.x ? 1 : -1);
+      triggerWaterJump(dir);
+      queueGlobalEvent("jump", gx, gy, dir);
       return;
     }
 
@@ -2260,6 +2569,7 @@
       }
 
       spawnSurfaceRipple(gx, 0.55);
+      queueGlobalEvent("bubble", gx, clampedY, 1);
 
       for (let i = 0; i < rocks.length; i++) {
         const r = rocks[i];
@@ -2282,6 +2592,7 @@
           fish.stateTimer = randRange(1.4, 2.6);
         }
       }
+      if (isLeader) pushGlobalState(true);
     }
   }
 
@@ -2305,6 +2616,7 @@
 
   window.addEventListener("load", () => {
     resizeWorld();
+    initGlobalSync();
     requestAnimationFrame(tick);
   });
 })();
